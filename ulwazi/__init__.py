@@ -27,10 +27,13 @@ from bs4.element import AttributeValueList
 from docutils import nodes
 from sphinx.application import Sphinx
 from sphinx.config import Config
+from sphinx.util import logging as sphinx_logging
 from sphinx.util.typing import ExtensionMetadata
 
 from ulwazi.navigation import get_navigation_tree
 from ulwazi.tabs import convert_tabs
+
+logger = sphinx_logging.getLogger(__name__)
 
 
 def setup(app: Sphinx) -> ExtensionMetadata:
@@ -41,7 +44,7 @@ def setup(app: Sphinx) -> ExtensionMetadata:
     :returns: The extension's metadata
     """
     app.add_html_theme("ulwazi", str(Path(__file__).parent / "theme/ulwazi"))
-    app.add_config_value("localtoc_max_depth", None, "html")
+    app.add_config_value("localtoc_max_depth", 3, "html", types=(int, type(None)))
     app.connect(  # pyright: ignore [reportUnknownMemberType]
         "config-inited",
         config_inited,
@@ -86,10 +89,28 @@ def config_inited(app: Sphinx, config: Config) -> None:
         "js/theme-toggle.js",
     ]
 
+    # Deprecated aliases from the old canonical-sphinx theme: honour them if
+    # set, but only when the user hasn't already set the new-style name.
+    deprecated_aliases = [
+        ("github_version", "repo_branch"),
+        ("github_folder", "repo_folder"),
+    ]
+    for old_name, new_name in deprecated_aliases:
+        if old_name in html_context and new_name not in html_context:
+            logger.warning(
+                f"conf.py setting '{old_name}' is deprecated. Use '{new_name}' instead.",
+            )
+            value = html_context[old_name]
+            if old_name == "github_folder":
+                folder = str(value).strip("/")
+                value = f"/{folder}/" if folder else "/"
+            html_context[new_name] = value
+
     values_and_defaults = [
         ("product_tag", "_static/tag.png"),
-        ("github_version", "main"),
-        ("github_folder", "docs"),
+        ("repo_branch", "main"),
+        ("repo_folder", "/docs/"),
+        ("default_source_extension", ".rst"),
         ("github_issues", "enabled"),
         ("discourse", "https://discourse.ubuntu.com"),
         ("sequential_nav", "none"),
@@ -306,14 +327,14 @@ def modify_local_toc(toc: str) -> str:
     return str(toc_html)
 
 
-def truncate_local_toc(toc: str, max_depth: int = -1) -> str:
+def truncate_local_toc(toc: str, max_depth: int | None = -1) -> str:
     """Limit the number of nested levels if localtoc_max_depth is set in conf.py."""
     if not toc:
         return toc
 
     toc_html = BeautifulSoup(toc, "html.parser")
 
-    if max_depth != -1:
+    if max_depth is not None and max_depth != -1:
 
         def trim_ul(ul: Tag, depth: int = 1) -> None:
             if depth >= max_depth:
@@ -427,7 +448,7 @@ def _html_page_context(
     if "toc" in context:
         context["toc"] = modify_local_toc(context["toc"])
         context["toc"] = truncate_local_toc(
-            context["toc"], getattr(app.config, "localtoc_max_depth", -1)
+            context["toc"], getattr(app.config, "localtoc_max_depth", 3)
         )
 
     # Build navigation breadcrumb mapping for search
