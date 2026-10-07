@@ -13,6 +13,8 @@ import pytest
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import expect, sync_playwright
 
+from js_coverage import JSCoverageRecorder
+
 CHEAT_SHEETS = ("content/myst-cheat-sheet", "content/rst-cheat-sheet")
 ADMONITIONS = ("content/test6_admonitions", "content/test7_admonitionsMD")
 NOTIFICATIONS = {
@@ -120,6 +122,35 @@ def _check_admonitions(name, soup, *, full_mapping=False):
     return errors
 
 
+def _check_inline_code_and_tables(name, soup):
+    """Verify both cheatsheets' inline code and representative table content."""
+    errors = []
+    inline_code = soup.select_one("#inline-formatting li code")
+    if (
+        not inline_code
+        or inline_code.get_text(strip=True) != "code"
+        or inline_code.get("class")
+        or inline_code.find() is not None
+    ):
+        errors.append(f"[{name}] inline code: expected plain <code>code</code>")
+
+    for kind in ("grid-tables", "list-tables", "csv-tables"):
+        table = soup.select_one(f"section#{kind} table.docutils")
+        cells = table.select("tbody tr:first-child td") if table else []
+        if (
+            not table
+            or [cell.get_text(" ", strip=True) for cell in table.select("thead th")]
+            != ["Header 1", "Header 2"]
+            or len(cells) != 2
+            or not all(
+                cell.get_text(" ", strip=True).startswith(expected)
+                for cell, expected in zip(cells, ("[1,1]", "[1,2]"))
+            )
+        ):
+            errors.append(f"[{name}] {kind}: expected header and first data row")
+    return errors
+
+
 def test_features_fast(built_site):
     """One grouped fast result for Python post-processing and theme markup."""
     errors = []
@@ -156,6 +187,7 @@ def test_features_fast(built_site):
         errors.extend(_check_toc(name, soup))
         errors.extend(_check_tabs(name, soup))
         errors.extend(_check_admonitions(name, soup))
+        errors.extend(_check_inline_code_and_tables(name, soup))
         body_list = soup.select_one(
             "main#content article ul.p-list--unordered > li.p-list__item"
         )
@@ -215,19 +247,25 @@ def _serve_site(output):
 
 
 @pytest.mark.slow
+@pytest.mark.coverage_js
 def test_features_slow(built_site):  # noqa: PLR0915
     """One browser result for controls that cannot be verified in static HTML."""
     subprocess.run(
         [sys.executable, "-m", "playwright", "install", "chromium"], check=True
     )
     errors = []
+    js_coverage = JSCoverageRecorder(built_site.output / "_static")
     with _serve_site(built_site.output) as base, sync_playwright() as playwright:
         browser = playwright.chromium.launch()
         try:
             context = browser.new_context(viewport={"width": 1280, "height": 900})
+            context.grant_permissions(
+                ["clipboard-read", "clipboard-write"], origin=base
+            )
             page = context.new_page()
             page_errors = []
             page.on("pageerror", lambda error: page_errors.append(str(error)))
+            js_coverage.start(page)
 
             def navigate(path):
                 page.goto(f"{base}/{path}", wait_until="domcontentloaded")
@@ -237,7 +275,11 @@ def test_features_slow(built_site):  # noqa: PLR0915
                     navigate(start)
                     check()
                 except (AssertionError, PlaywrightError) as exc:
-                    errors.append(f"[{label}] {str(exc)[-1600:].strip()}")
+                    message = str(exc).strip() or type(exc).__name__
+                    if len(message) > 1600:
+                        # Preserve the exception's headline as well as its call log.
+                        message = f"{message.splitlines()[0]}\n...\n{message[-1400:]}"
+                    errors.append(f"[{label}] {message}")
 
             def cookie_consent():
                 # A fresh browser context has no consent cookie. Test the
@@ -294,7 +336,7 @@ def test_features_slow(built_site):  # noqa: PLR0915
             def tabs():
                 tabset = (
                     page.locator("main .p-tabs")
-                    .filter(has=page.get_by_text("Content Tab 1", exact=True))
+                    .filter(has=page.get_by_text("Content for tab 1", exact=True))
                     .first
                 )
                 second = tabset.get_by_role("tab", name="Tab 2")
@@ -302,7 +344,7 @@ def test_features_slow(built_site):  # noqa: PLR0915
                 expect(second).to_have_attribute("aria-selected", "true")
                 expect(
                     tabset.locator(f"#{second.get_attribute('aria-controls')}")
-                ).to_contain_text("Content Tab 2")
+                ).to_contain_text("Content for tab 2")
                 second.press(
                     "ArrowRight"
                 )  # vanilla-tabs.js selects the next tab on keyup/focus.
@@ -312,6 +354,26 @@ def test_features_slow(built_site):  # noqa: PLR0915
                 expect(
                     tabset.locator(f"#{third.get_attribute('aria-controls')}")
                 ).to_be_visible()
+
+            def copy_button():
+                # Test the extension-generated control with a real Chromium
+                # clipboard on the YAML sample, not merely copybutton.js.
+                block = page.locator(
+                    "#code-blocks-font-test .highlight-yaml .highlight"
+                ).first
+                button = block.locator("button.copybtn")
+                expect(button).to_be_attached()
+                source = block.locator("pre")
+                assert button.get_attribute("data-clipboard-target") == (
+                    f"#{source.get_attribute('id')}"
+                ), "copy button must target the displayed code block"
+                expect(source).to_contain_text("version: 2")
+                button.click()
+                expect(button).to_have_class(re.compile(r"\bsuccess\b"))
+                copied = page.evaluate("navigator.clipboard.readText()")
+                assert "version: 2" in copied, (
+                    f"copy button copied unexpected text: {copied!r}"
+                )
 
             def theme():
                 toggle = page.locator(".theme-toggle")
@@ -358,12 +420,24 @@ def test_features_slow(built_site):  # noqa: PLR0915
                 ("cookie consent", cookie_consent, ""),
                 ("navigation", navigation, "content/myst-cheat-sheet/"),
                 ("tabs", tabs, "content/myst-cheat-sheet/"),
+                ("copy button", copy_button, "content/myst-cheat-sheet/"),
                 ("dark mode", theme, "content/myst-cheat-sheet/"),
                 ("search", search, "content/myst-cheat-sheet/"),
             ):
                 journey(label, check, start)
+            js_coverage.stop(page)
             context.close()
         finally:
             browser.close()
 
-    assert not errors, "Features [slow] checks failed:\n  - " + "\n  - ".join(errors)
+    js_report = js_coverage.write()
+    for name, data in js_report.items():
+        print(f"[js-coverage] {name}: {data['percent']}%")
+
+    if errors:
+        summary = "; ".join(error.splitlines()[0] for error in errors)
+        pytest.fail(
+            f"Features [slow] checks failed: {summary}\nDetails:\n  - "
+            + "\n  - ".join(errors),
+            pytrace=False,
+        )
